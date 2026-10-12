@@ -1,0 +1,17 @@
+[Unit]
+Description=Worklenz – All-in-one Projektmanagement (Docker Compose: Frontend + Backend + Postgres + SeaweedFS + Nginx)
+Documentation=https://github.com/Worklenz/worklenz
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/worklenz
+ExecStart=/usr/bin/docker compose up
+ExecStop=/usr/bin/docker compose down
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
