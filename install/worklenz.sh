@@ -376,6 +376,16 @@ if [[ -z "$ADMIN_PASSWORD" ]]; then
 fi
 # Base64-Transport in den Container (sonderzeichensicher, kein Eval/Quote-Bruch)
 ADMIN_PASSWORD_B64="$(printf '%s' "$ADMIN_PASSWORD" | base64 -w0)"
+# Zeichen, die Heredoc-Expansion ("$", Backtick) oder JSON (" , \) brechen,
+# werden abgelehnt (Allowlist-Pruefung, kein Backslash-Literal noetig).
+# Generiertes Default-Passwort enthaelt nur Allowlist-Zeichen.
+for _av in "$ADMIN_EMAIL" "$ADMIN_NAME" "$ADMIN_PASSWORD"; do
+  _kept="$(printf '%s' "$_av" | tr -cd 'A-Za-z0-9@._+! #%*=?^{|}~,:;()/=-')"
+  if [[ "$_kept" != "$_av" ]]; then
+    msg_error "Admin-Wert mit unzulässigen Zeichen: '${_av:0:30}...' – erlaubt: Buchstaben/Ziffern/Leerzeichen plus @._+! #%*=?^~,:;()/=- (kein \" \\ \$ Backtick [ ] & ' \` + = |)."
+    exit 1
+  fi
+done
 
 # Setup-Skript lokal bauen (Host-Variablen werden HIER expandiert,
 # Container-Variablen sind mit \$ escaped und werden ERST im LXC expandiert).
@@ -603,13 +613,12 @@ if [[ -f /opt/worklenz/.admin-created ]]; then
   echo "[LXC] Erst-Admin bereits angelegt (\$(cat /opt/worklenz/.admin-created 2>/dev/null || echo unbekannt)) – wird nicht erneut erstellt."
 else
   ADMIN_PW="\$(printf '%s' "\$ADMIN_PASSWORD_B64" | base64 -d)"
-  JSON_PW="\$(printf '%s' "\$ADMIN_PW" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-  JSON_EMAIL="\$(printf '%s' "\$ADMIN_EMAIL" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-  JSON_NAME="\$(printf '%s' "\$ADMIN_NAME" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  # Kein sed-Maskieren noetig: Host validiert, dass keine JSON/Heredoc-
+  # Sonderzeichen (", \, $, Backtick) in den Werten stecken.
+  SIGNUP_JSON="{\"name\":\"\$ADMIN_NAME\",\"email\":\"\$ADMIN_EMAIL\",\"password\":\"\$ADMIN_PW\"}"
   JAR="\$(mktemp)"
   CSRF="\$(curl -fsS -c "\$JAR" -b "\$JAR" --max-time 15 "http://127.0.0.1:\$BACKEND_PORT/csrf-token" 2>/dev/null | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || true)"
   if [[ -z "\$CSRF" ]]; then echo "[LXC][WARN] Kein CSRF-Token erhalten – Admin-Anlage wird trotzdem versucht (ohne Header)."; fi
-  SIGNUP_JSON="{\"name\":\"\$JSON_NAME\",\"email\":\"\$JSON_EMAIL\",\"password\":\"\$JSON_PW\"}"
   SIGNUP_OUT="\$(mktemp)"
   if [[ -n "\$CSRF" ]]; then
     SIGNUP_CODE="\$(curl -s -o "\$SIGNUP_OUT" -w "%{http_code}" --max-time 30 -b "\$JAR" -c "\$JAR" -H "Content-Type: application/json" -H "X-CSRF-Token: \$CSRF" -d "\$SIGNUP_JSON" "http://127.0.0.1:\$BACKEND_PORT/api/auth/signup" 2>/dev/null || true)"
@@ -618,7 +627,7 @@ else
   fi
   rm -f "\$JAR"
   [[ -z "\$SIGNUP_CODE" ]] && SIGNUP_CODE="000"
-  echo "[LXC] Signup-Antwort (HTTP \$SIGNUP_CODE): \$((head -c 500 "\$SIGNUP_OUT" 2>/dev/null || true))"
+  echo "[LXC] Signup-Antwort (HTTP \$SIGNUP_CODE): \$(head -c 500 "\$SIGNUP_OUT" 2>/dev/null | tr '\n' ' ' || true)"
   if grep -q '"done":true' "\$SIGNUP_OUT" 2>/dev/null; then
     printf '%s\n' "\$ADMIN_EMAIL" > /opt/worklenz/.admin-created
     chmod 600 /opt/worklenz/.admin-created
@@ -633,7 +642,7 @@ else
     echo "[LXC][WARN] Erst-Admin konnte nicht angelegt werden – manuell im Browser registrieren (Name mind. 4 Zeichen, Passwort mind. 8 Zeichen mit Gross-/Kleinbuchstabe, Ziffer + Sonderzeichen @$!%*?&#)."
   fi
   rm -f "\$SIGNUP_OUT"
-  unset ADMIN_PW JSON_PW
+  unset ADMIN_PW
 fi
 echo "[LXC] Service aktiv: \$(systemctl is-active worklenz)"
 echo "[LXC] Container: \$(docker ps --format '{{.Names}} {{.Status}}' | tr '\\n' '; ')"

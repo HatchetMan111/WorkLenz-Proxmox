@@ -208,6 +208,9 @@ Schluss-Box (danach steht er zusätzlich im Install-Log — sicher verwahren):
   Passwort-Policy (Upstream, sonst schlägt die Anlage fehl): mind. 8 Zeichen,
   Klein- + Großbuchstabe + Ziffer + Sonderzeichen aus `@$!%*?&#`; Name mind.
   4 Zeichen. Das generierte Default-Passwort erfüllt das immer.
+  Für `--admin-email/--admin-name/--admin-password` gilt zusätzlich:
+  kein `"`, `\`, `$`, Backtick, `[`/`]`, `&` (Heredoc-/JSON-sicher) —
+  der Installer bricht sonst mit klarer Meldung ab.
 - Bereits angelegt (Re-Run-Marker `/opt/worklenz/.admin-created`): kein neuer
   Account, die Box zeigt die Mail mit Hinweis auf den Erstlauf. Passwort
   vergessen → per Login-Maske „Passwort zurücksetzen" (braucht SMTP, siehe
