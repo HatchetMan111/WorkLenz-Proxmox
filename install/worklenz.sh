@@ -365,6 +365,14 @@ UPSTREAM_REPO="${UPSTREAM_REPO}"
 echo "[LXC] apt update + Basis-Pakete ..."
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
+echo "[LXC] APT-Quellen prüfen/normalisieren (Template-Ablage) ..."
+echo "[LXC] --- /etc/apt/sources.list (vorher) ---"
+cat /etc/apt/sources.list 2>/dev/null || true
+# Manche Debian-12-Templates enthalten die veraltete Security-URL ohne
+# /debian-security-Pfad (-> GPG-Fehler "no longer signed", apt Exit 100).
+# Idempotent normalisieren (nach dem Fix matcht das Pattern nicht mehr):
+sed -i 's|http://security.debian.org bookworm-security|http://security.debian.org/debian-security bookworm-security|g' /etc/apt/sources.list 2>/dev/null || true
+sed -i 's|http://security.debian.org bookworm-security|http://security.debian.org/debian-security bookworm-security|g' /etc/apt/sources.list.d/* 2>/dev/null || true
 apt-get update
 apt-get install -y --no-install-recommends curl ca-certificates openssl iproute2 procps git
 
