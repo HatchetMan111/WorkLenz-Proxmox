@@ -45,11 +45,18 @@ DEFAULT_OS="debian-12-standard"              # Template-Familie (Docker-getestet
 UNPRIVILEGED="1"
 FEATURES="nesting=1,keyctl=1"                # nesting/keyctl = Docker im LXC nötig
 
+# Erst-Admin (wird per App-Signup-API angelegt + in Schluss-Box gedruckt)
+DEFAULT_ADMIN_EMAIL="admin@worklenz.local"
+DEFAULT_ADMIN_NAME="Worklenz Admin"
+
 # Umgebungs-Overrides erlauben: CT_ID=101 CORES=4 RAM=8192 DISK=20 ./worklenz.sh
 CT_ID_ARG="${CT_ID:-${CTID:-}}"
 CORES_ARG="${CORES:-$DEFAULT_CORES}"
 RAM_ARG="${RAM:-$DEFAULT_RAM}"
 DISK_ARG="${DISK:-$DEFAULT_DISK}"
+ADMIN_EMAIL_ARG="${ADMIN_EMAIL:-}"
+ADMIN_PASSWORD_ARG="${ADMIN_PASSWORD:-}"
+ADMIN_NAME_ARG="${ADMIN_NAME:-}"
 
 DEBUG="${DEBUG:-0}"
 LOG_FILE="/tmp/${APP}-install-$(date +%F-%H%M%S).log"
@@ -96,6 +103,9 @@ Optionen:
   --bridge NAME        Netzwerk-Bridge (Default: ${DEFAULT_BRIDGE})
   --password PW        Root-Passwort (Default: zufällig generiert, wird angezeigt)
   --ssh-key PATH       SSH Public Key in den Container übernehmen (optional)
+  --admin-email MAIL   Erst-Admin-Mail (Default: admin@worklenz.local)
+  --admin-password PW  Erst-Admin-Passwort (Default: zufällig generiert, Policy-konform)
+  --admin-name NAME    Erst-Admin-Name (Default: Worklenz Admin)
   --debug, -x          set -x + maximale Fehlermeldungskette
   --help, -h           diese Hilfe
 
@@ -168,6 +178,9 @@ TEMPLATE_STORE="$DEFAULT_TEMPLATE_STORE"
 BRIDGE="$DEFAULT_BRIDGE"
 ROOT_PASSWORD=""
 SSH_KEY=""
+ADMIN_EMAIL="$ADMIN_EMAIL_ARG"
+ADMIN_PASSWORD="$ADMIN_PASSWORD_ARG"
+ADMIN_NAME="$ADMIN_NAME_ARG"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -181,6 +194,9 @@ while [[ $# -gt 0 ]]; do
     --bridge)          BRIDGE="${2:?}"; shift 2 ;;
     --password)        ROOT_PASSWORD="${2:?}"; shift 2 ;;
     --ssh-key)         SSH_KEY="${2:?}"; shift 2 ;;
+    --admin-email)     ADMIN_EMAIL="${2:?--admin-email braucht einen Wert}"; shift 2 ;;
+    --admin-password)  ADMIN_PASSWORD="${2:?--admin-password braucht einen Wert}"; shift 2 ;;
+    --admin-name)      ADMIN_NAME="${2:?--admin-name braucht einen Wert}"; shift 2 ;;
     --debug|-x)        DEBUG="1"; set -x; shift ;;
     --help|-h)         usage; exit 0 ;;
     *) msg_error "Unbekannte Option: $1"; usage; exit 1 ;;
@@ -351,6 +367,16 @@ RestartSec=10
 WantedBy=multi-user.target
 UNIT_EOF
 
+# Erst-Admin-Defaults auflösen (Passwort Policy-konform: min. 8 Zeichen,
+# Klein-/Großbuchstabe, Ziffer, Sonderzeichen – vgl. SignupPage-Regeln)
+if [[ -z "$ADMIN_EMAIL" ]]; then ADMIN_EMAIL="$DEFAULT_ADMIN_EMAIL"; fi
+if [[ -z "$ADMIN_NAME" ]]; then ADMIN_NAME="$DEFAULT_ADMIN_NAME"; fi
+if [[ -z "$ADMIN_PASSWORD" ]]; then
+  ADMIN_PASSWORD="Apw-$(openssl rand -hex 10)!9"
+fi
+# Base64-Transport in den Container (sonderzeichensicher, kein Eval/Quote-Bruch)
+ADMIN_PASSWORD_B64="$(printf '%s' "$ADMIN_PASSWORD" | base64 -w0)"
+
 # Setup-Skript lokal bauen (Host-Variablen werden HIER expandiert,
 # Container-Variablen sind mit \$ escaped und werden ERST im LXC expandiert).
 TMP_SETUP="$(mktemp /tmp/worklenz-setup.XXXXXX.sh)"
@@ -362,6 +388,9 @@ FRONTEND_PORT="${FRONTEND_PORT}"
 BACKEND_PORT="${BACKEND_PORT}"
 HTTP_PORT="${HTTP_PORT}"
 UPSTREAM_REPO="${UPSTREAM_REPO}"
+ADMIN_EMAIL="${ADMIN_EMAIL}"
+ADMIN_PASSWORD_B64="${ADMIN_PASSWORD_B64}"
+ADMIN_NAME="${ADMIN_NAME}"
 
 echo "[LXC] apt update + Basis-Pakete ..."
 export DEBIAN_FRONTEND=noninteractive
@@ -565,6 +594,47 @@ if ! wait_for_http "Backend (/public/health)" "http://127.0.0.1:\$BACKEND_PORT/p
   exit 1
 fi
 
+# --- Erst-Admin anlegen (idempotent, ueber die app-eigene Signup-API) ---
+# Nutzt POST /api/auth/signup mit CSRF-Flow wie das Frontend (api-client.ts):
+# GET /csrf-token -> POST mit X-CSRF-Token + Session-Cookie. Dadurch stimmen
+# Validierung, Hash und Org-Anlage garantiert (kein SQL-Hack ins DB-Schema).
+rm -f /tmp/worklenz-admin-creds
+if [[ -f /opt/worklenz/.admin-created ]]; then
+  echo "[LXC] Erst-Admin bereits angelegt (\$(cat /opt/worklenz/.admin-created 2>/dev/null || echo unbekannt)) – wird nicht erneut erstellt."
+else
+  ADMIN_PW="\$(printf '%s' "\$ADMIN_PASSWORD_B64" | base64 -d)"
+  JSON_PW="\$(printf '%s' "\$ADMIN_PW" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  JSON_EMAIL="\$(printf '%s' "\$ADMIN_EMAIL" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  JSON_NAME="\$(printf '%s' "\$ADMIN_NAME" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  JAR="\$(mktemp)"
+  CSRF="\$(curl -fsS -c "\$JAR" -b "\$JAR" --max-time 15 "http://127.0.0.1:\$BACKEND_PORT/csrf-token" 2>/dev/null | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || true)"
+  if [[ -z "\$CSRF" ]]; then echo "[LXC][WARN] Kein CSRF-Token erhalten – Admin-Anlage wird trotzdem versucht (ohne Header)."; fi
+  SIGNUP_JSON="{\"name\":\"\$JSON_NAME\",\"email\":\"\$JSON_EMAIL\",\"password\":\"\$JSON_PW\"}"
+  SIGNUP_OUT="\$(mktemp)"
+  if [[ -n "\$CSRF" ]]; then
+    SIGNUP_CODE="\$(curl -s -o "\$SIGNUP_OUT" -w "%{http_code}" --max-time 30 -b "\$JAR" -c "\$JAR" -H "Content-Type: application/json" -H "X-CSRF-Token: \$CSRF" -d "\$SIGNUP_JSON" "http://127.0.0.1:\$BACKEND_PORT/api/auth/signup" 2>/dev/null || true)"
+  else
+    SIGNUP_CODE="\$(curl -s -o "\$SIGNUP_OUT" -w "%{http_code}" --max-time 30 -b "\$JAR" -c "\$JAR" -H "Content-Type: application/json" -d "\$SIGNUP_JSON" "http://127.0.0.1:\$BACKEND_PORT/api/auth/signup" 2>/dev/null || true)"
+  fi
+  rm -f "\$JAR"
+  [[ -z "\$SIGNUP_CODE" ]] && SIGNUP_CODE="000"
+  echo "[LXC] Signup-Antwort (HTTP \$SIGNUP_CODE): \$((head -c 500 "\$SIGNUP_OUT" 2>/dev/null || true))"
+  if grep -q '"done":true' "\$SIGNUP_OUT" 2>/dev/null; then
+    printf '%s\n' "\$ADMIN_EMAIL" > /opt/worklenz/.admin-created
+    chmod 600 /opt/worklenz/.admin-created
+    { printf '%s\n' "\$ADMIN_EMAIL"; printf '%s\n' "\$ADMIN_PW"; } > /tmp/worklenz-admin-creds
+    chmod 600 /tmp/worklenz-admin-creds
+    echo "[LXC] Erst-Admin angelegt: \$ADMIN_EMAIL (Zugangsdaten zeigt die Host-Schluss-Box)."
+  elif grep -qi 'already\|exists\|vergeben\|registered' "\$SIGNUP_OUT" 2>/dev/null; then
+    printf '%s\n' "\$ADMIN_EMAIL" > /opt/worklenz/.admin-created
+    chmod 600 /opt/worklenz/.admin-created
+    echo "[LXC][WARN] Admin-Mail existiert bereits – kein neuer Account (Passwort aus Erstlauf verwenden)."
+  else
+    echo "[LXC][WARN] Erst-Admin konnte nicht angelegt werden – manuell im Browser registrieren (Name mind. 4 Zeichen, Passwort mind. 8 Zeichen mit Gross-/Kleinbuchstabe, Ziffer + Sonderzeichen @$!%*?&#)."
+  fi
+  rm -f "\$SIGNUP_OUT"
+  unset ADMIN_PW JSON_PW
+fi
 echo "[LXC] Service aktiv: \$(systemctl is-active worklenz)"
 echo "[LXC] Container: \$(docker ps --format '{{.Names}} {{.Status}}' | tr '\\n' '; ')"
 SETUP_EOF
@@ -574,6 +644,17 @@ msg_info "Setup-Skript lokal: $TMP_SETUP (Kopie bleibt zur Fehlersuche erhalten)
 pct push "$CTID" "$TMP_SETUP" /tmp/worklenz-setup.sh
 pct exec "$CTID" -- bash /tmp/worklenz-setup.sh
 msg_ok "Installation im Container abgeschlossen."
+
+# Erst-Login aus dem Container abholen (nur-Erstlauf-Passwort, transient).
+# Die Datei wird im Container sofort wieder gelöscht; die Box unten druckt
+# einmalig, das Host-Log enthält sie (sicher verwahren/löschen).
+ADMIN_CREDS_EMAIL=""
+ADMIN_CREDS_PW=""
+if pct exec "$CTID" -- test -f /tmp/worklenz-admin-creds 2>/dev/null; then
+  ADMIN_CREDS_EMAIL="$(pct exec "$CTID" -- sed -n '1p' /tmp/worklenz-admin-creds 2>/dev/null || true)"
+  ADMIN_CREDS_PW="$(pct exec "$CTID" -- sed -n '2p' /tmp/worklenz-admin-creds 2>/dev/null || true)"
+  pct exec "$CTID" -- rm -f /tmp/worklenz-admin-creds || true
+fi
 
 # ---------------------------------------------------------------------------
 # Verifikation vom Host aus (Service + HTTP + IP)
@@ -625,6 +706,13 @@ echo -e "${C_GREEN}${C_BOLD}════════════════ INS
 echo -e "  App          : ${C_BOLD}Worklenz – All-in-one Projektmanagement${C_RESET}"
 echo -e "  Container    : CT ${C_BOLD}${CTID}${C_RESET} (Hostname: ${C_BOLD}${HOSTNAME_FINAL}${C_RESET}, onboot=1)"
 echo -e "  Ressourcen   : ${CORES} vCPU / ${RAM} MB RAM / ${DISK} GB Disk"
+if [[ -n "${ADMIN_CREDS_PW:-}" ]]; then
+echo -e "  Erst-Login   : ${C_BOLD}${ADMIN_CREDS_EMAIL} / ${ADMIN_CREDS_PW}${C_RESET} (nur jetzt angezeigt – nach Login aendern!)"
+elif ADMIN_MARKER="$(pct exec "$CTID" -- cat /opt/worklenz/.admin-created 2>/dev/null || true)"; [[ -n "$ADMIN_MARKER" ]]; then
+echo -e "  Erst-Login   : ${ADMIN_MARKER} (bereits angelegt – Passwort aus Erstlauf verwenden)"
+else
+echo -e "  Erst-Login   : im Browser registrieren (https://<LXC-IP> -> Sign up; Name mind. 4 Zeichen, starkes Passwort)"
+fi
 if [[ -n "${CT_IP:-}" ]]; then
 echo -e "  Web-UI       : ${C_BOLD}https://${CT_IP}${C_RESET} (Nginx, primaer, self-signed – Browser-Warnung bestaetigen)"
 echo -e "  Health       : http://${CT_IP}:${HTTP_PORT}/health"

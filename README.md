@@ -72,6 +72,7 @@ Erwartete Schlussausgabe (Beispiel):
   Web-UI       : https://192.168.1.100 (self-signed – Warnung bestätigen)
   Health       : http://192.168.1.100:80/health
   Frontend     : http://192.168.1.100:5000
+  Erst-Login   : admin@worklenz.local / Apw-... (nur jetzt angezeigt – nach Login ändern!)
   API          : http://192.168.1.100:3000
   Portal       : http://192.168.1.100:5174
   S3           : http://192.168.1.100:8333
@@ -185,3 +186,36 @@ damit der Einzeiler ohne weitere Dateien auskommt. Der Compose-Stack aus Upstrea
   Kein Installer-Fehler; ggf. Upstream-Issue prüfen.
 - Erster Start zieht ~3–4 GB Images + DB-Init — Web UI kann 2–5 Minuten brauchen
   (beide Ports werden bis zu 240 s gepollt).
+
+## 8. Anmeldung – Erst-Login aus der Ausgabe-Box
+
+Der Installer legt beim Erstlauf automatisch einen Admin-Account über
+Worklenz' eigene Signup-API an und druckt ihn **genau einmal** in der
+Schluss-Box (danach steht er zusätzlich im Install-Log — sicher verwahren):
+
+```text
+  Erst-Login   : admin@worklenz.local / Apw-... (nur jetzt angezeigt – nach Login ändern!)
+```
+
+- Im Browser auf `https://<LXC-IP>` (Warnung bestätigen) mit diesen Daten
+  anmelden, danach unter Profil **Passwort ändern**.
+- Eigene Werte (idempotent, Re-Run legt nichts doppelt an):
+  ```bash
+  bash worklenz.sh --ctid 100 --admin-email ich@domain.tld --admin-name "Mein Name"
+  bash worklenz.sh --ctid 100 --admin-email ich@domain.tld --admin-password 'Starkes-Passwort!9A'
+  # als ENV: ADMIN_EMAIL=.. ADMIN_PASSWORD=.. ADMIN_NAME=.. bash worklenz.sh --ctid 100
+  ```
+  Passwort-Policy (Upstream, sonst schlägt die Anlage fehl): mind. 8 Zeichen,
+  Klein- + Großbuchstabe + Ziffer + Sonderzeichen aus `@$!%*?&#`; Name mind.
+  4 Zeichen. Das generierte Default-Passwort erfüllt das immer.
+- Bereits angelegt (Re-Run-Marker `/opt/worklenz/.admin-created`): kein neuer
+  Account, die Box zeigt die Mail mit Hinweis auf den Erstlauf. Passwort
+  vergessen → per Login-Maske „Passwort zurücksetzen" (braucht SMTP, siehe
+  unten) oder Account neu anlegen.
+- Manuelle Registrierung geht jederzeit parallel (`Sign up` im Browser, das
+  erste Konto wird Owner) — gleiche Policy wie oben; genau daran scheitert
+  übrigens ein manuelles „Failed to validate signup details" fast immer
+  (zu schwaches Passwort oder Name < 4 Zeichen).
+- Mailversand (Einladungen/Reset) braucht SMTP in `/opt/worklenz/.env`
+  (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM`),
+  danach im Container `docker compose up -d && systemctl restart worklenz`.
