@@ -100,7 +100,8 @@ Optionen:
   --help, -h           diese Hilfe
 
 Nach der Installation:
-  Web-UI:  http://<LXC-IP>:${HTTP_PORT}  (Nginx, primär)
+  Web-UI:  https://<LXC-IP>  (Nginx, primär, self-signed – Warnung bestätigen)
+  Health:  http://<LXC-IP>:${HTTP_PORT}/health (ohne Redirect, 200)
   Direkt:  http://<LXC-IP>:${FRONTEND_PORT} (Frontend), :${BACKEND_PORT} (API),
            :${PORTAL_PORT} (Portal), :${S3_PORT} (S3)
 EOF
@@ -485,6 +486,20 @@ set_url DEPLOYMENT_MODE "express"
 chmod 0600 /opt/worklenz/.env
 echo "[LXC] .env aktualisiert (DOMAIN=\$LXC_IP)."
 
+echo "[LXC] SSL-Zertifikat sicherstellen (Upstream: self-signed, wie manage.sh setup_self_signed_ssl) ..."
+mkdir -p /opt/worklenz/nginx/ssl
+if [[ ! -f /opt/worklenz/nginx/ssl/cert.pem || ! -f /opt/worklenz/nginx/ssl/key.pem ]]; then
+  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout /opt/worklenz/nginx/ssl/key.pem \
+    -out /opt/worklenz/nginx/ssl/cert.pem \
+    -subj "/C=US/ST=State/L=City/O=Worklenz/CN=localhost"
+  chmod 644 /opt/worklenz/nginx/ssl/cert.pem
+  chmod 600 /opt/worklenz/nginx/ssl/key.pem
+  echo "[LXC] Self-signed Zertifikat erzeugt (Browser-Warnung bestaetigen)."
+else
+  echo "[LXC] SSL-Zertifikat bereits vorhanden – wird wiederverwendet."
+fi
+
 echo "[LXC] systemd-Unit schreiben ..."
 cat > /etc/systemd/system/worklenz.service <<UNIT_INNER_EOF
 ${UNIT_FILE}
@@ -526,8 +541,8 @@ wait_for_http() {
   return 1
 }
 
-echo "[LXC] Warte auf Nginx (http://127.0.0.1:\$HTTP_PORT, max 240s) ..."
-if ! wait_for_http "Nginx" "http://127.0.0.1:\$HTTP_PORT"; then
+echo "[LXC] Warte auf Nginx (http://127.0.0.1:\$HTTP_PORT/health, max 240s) ..."
+if ! wait_for_http "Nginx (/health)" "http://127.0.0.1:\$HTTP_PORT/health"; then
   echo "[LXC][ERROR] Nginx-Diagnose:" >&2
   systemctl status worklenz --no-pager --full >&2 || true
   journalctl -u worklenz --no-pager -n 100 >&2 || true
@@ -539,6 +554,13 @@ fi
 echo "[LXC] Warte auf Frontend (http://127.0.0.1:\$FRONTEND_PORT, max 240s) ..."
 if ! wait_for_http "Frontend" "http://127.0.0.1:\$FRONTEND_PORT"; then
   echo "[LXC][ERROR] Frontend-Diagnose:" >&2
+  docker compose logs --tail=100 --no-color >&2 || true
+  exit 1
+fi
+
+echo "[LXC] Warte auf Backend (http://127.0.0.1:\$BACKEND_PORT/public/health, max 240s) ..."
+if ! wait_for_http "Backend (/public/health)" "http://127.0.0.1:\$BACKEND_PORT/public/health"; then
+  echo "[LXC][ERROR] Backend-Diagnose:" >&2
   docker compose logs --tail=100 --no-color >&2 || true
   exit 1
 fi
@@ -568,14 +590,14 @@ if [[ "$SERVICE_STATE" != "active" ]]; then
 fi
 msg_ok "Service läuft (systemctl is-active $APP = active)."
 
-NGINX_CODE="$(pct exec "$CTID" -- curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:${HTTP_PORT}" 2>/dev/null || true)"
+NGINX_CODE="$(pct exec "$CTID" -- curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:${HTTP_PORT}/health" 2>/dev/null || true)"
 [[ -z "$NGINX_CODE" ]] && NGINX_CODE="000"
 if [[ "$NGINX_CODE" == "000" ]]; then
-  msg_error "HTTP-Check fehlgeschlagen: Nginx http://127.0.0.1:${HTTP_PORT} antwortet nicht (keine Verbindung)."
+  msg_error "HTTP-Check fehlgeschlagen: Nginx http://127.0.0.1:${HTTP_PORT}/health antwortet nicht (keine Verbindung)."
   pct exec "$CTID" -- docker compose -f /opt/worklenz/docker-compose.yml logs --tail=100 --no-color || true
   exit 1
 fi
-msg_ok "Nginx antwortet (HTTP $NGINX_CODE auf localhost:${HTTP_PORT})."
+msg_ok "Nginx antwortet (HTTP $NGINX_CODE auf localhost:${HTTP_PORT}/health)."
 
 FRONTEND_CODE="$(pct exec "$CTID" -- curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:${FRONTEND_PORT}" 2>/dev/null || true)"
 [[ -z "$FRONTEND_CODE" ]] && FRONTEND_CODE="000"
@@ -586,6 +608,15 @@ if [[ "$FRONTEND_CODE" == "000" ]]; then
 fi
 msg_ok "Frontend antwortet (HTTP $FRONTEND_CODE auf localhost:${FRONTEND_PORT})."
 
+BACKEND_CODE="$(pct exec "$CTID" -- curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:${BACKEND_PORT}/public/health" 2>/dev/null || true)"
+[[ -z "$BACKEND_CODE" ]] && BACKEND_CODE="000"
+if [[ "$BACKEND_CODE" == "000" ]]; then
+  msg_error "HTTP-Check fehlgeschlagen: Backend http://127.0.0.1:${BACKEND_PORT}/public/health antwortet nicht (keine Verbindung)."
+  pct exec "$CTID" -- docker compose -f /opt/worklenz/docker-compose.yml logs --tail=100 --no-color || true
+  exit 1
+fi
+msg_ok "Backend antwortet (HTTP $BACKEND_CODE auf localhost:${BACKEND_PORT}/public/health)."
+
 CT_IP="$(pct exec "$CTID" -- ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
 [[ -z "$CT_IP" ]] && CT_IP="$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}' || true)"
 
@@ -595,13 +626,14 @@ echo -e "  App          : ${C_BOLD}Worklenz – All-in-one Projektmanagement${C_
 echo -e "  Container    : CT ${C_BOLD}${CTID}${C_RESET} (Hostname: ${C_BOLD}${HOSTNAME_FINAL}${C_RESET}, onboot=1)"
 echo -e "  Ressourcen   : ${CORES} vCPU / ${RAM} MB RAM / ${DISK} GB Disk"
 if [[ -n "${CT_IP:-}" ]]; then
-echo -e "  Web-UI       : ${C_BOLD}http://${CT_IP}:${HTTP_PORT}${C_RESET} (Nginx, primär)"
+echo -e "  Web-UI       : ${C_BOLD}https://${CT_IP}${C_RESET} (Nginx, primaer, self-signed – Browser-Warnung bestaetigen)"
+echo -e "  Health       : http://${CT_IP}:${HTTP_PORT}/health"
 echo -e "  Frontend     : ${C_BOLD}http://${CT_IP}:${FRONTEND_PORT}${C_RESET} (direkt)"
 echo -e "  API          : http://${CT_IP}:${BACKEND_PORT}"
 echo -e "  Portal       : http://${CT_IP}:${PORTAL_PORT}"
 echo -e "  S3           : http://${CT_IP}:${S3_PORT}"
 else
-echo -e "  Web-UI       : ${C_BOLD}http://<LXC-IP>:${HTTP_PORT}${C_RESET} (IP konnte nicht auto-ermittelt werden: pct exec $CTID -- ip a)"
+echo -e "  Web-UI       : ${C_BOLD}https://<LXC-IP>${C_RESET} (IP konnte nicht auto-ermittelt werden: pct exec $CTID -- ip a)"
 fi
 if [[ "$CREATED_NOW" == "1" && "$GENERATED_PW" == "1" ]]; then
 echo -e "  Root-Passwort: ${C_BOLD}${ROOT_PASSWORD}${C_RESET} (nur jetzt angezeigt – sicher ablegen!)"
@@ -610,7 +642,7 @@ echo -e "  Service      : systemctl status ${APP}  (im Container via: pct enter 
 echo -e "  Stack        : cd /opt/worklenz && docker compose ps / docker compose logs -f (im Container)"
 echo -e "  Update       : Skript erneut laufen lassen (idempotent, zieht neueste Images + restart)"
 echo -e "  Deinstall    : pct stop ${CTID} && pct destroy ${CTID}"
-echo -e "  Reboot-Test  : pct reboot ${CTID} && sleep 90 && curl -fs http://${CT_IP:-<LXC-IP>}:${HTTP_PORT} >/dev/null && curl -fs http://${CT_IP:-<LXC-IP>}:${FRONTEND_PORT} >/dev/null"
+echo -e "  Reboot-Test  : pct reboot ${CTID} && sleep 90 && curl -fs http://${CT_IP:-<LXC-IP>}:${HTTP_PORT}/health >/dev/null && curl -fs http://${CT_IP:-<LXC-IP>}:${FRONTEND_PORT} >/dev/null"
 echo -e "  Log          : ${LOG_FILE}"
 echo -e "  Setup-Kopie  : ${TMP_SETUP}"
 if [[ "$DEBUG" != "1" ]]; then

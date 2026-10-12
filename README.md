@@ -20,7 +20,7 @@ S3 auf **8333**. systemd-Service mit `Restart=always`, Container mit `onboot=1`.
 | Zweck | All-in-one Projektmanagement (Tasks, Ressourcen, Zeit, Finanzen, Portal) |
 | Tech-Stack | React/Express (Docker) + PostgreSQL 15 + SeaweedFS + Nginx |
 | Upstream-Repo | `https://github.com/Worklenz/worklenz` |
-| Web UI | `http://<LXC-IP>:80` (Nginx, primär) + `http://<LXC-IP>:5000` (Frontend direkt), bind `0.0.0.0` via Docker-Ports |
+| Web UI | `https://<LXC-IP>` (Nginx, primär, self-signed — Browser-Warnung bestätigen) + `http://<LXC-IP>:5000` (Frontend direkt), bind `0.0.0.0` via Docker-Ports |
 | Standard-Ressourcen | 2 vCPU / 4096 MB RAM / 20 GB Disk (Minimum — 7+ Dienste, mit 2 GB OOM) |
 | CT-ID | immer die **nächste freie ID** (`pvesh get /cluster/nextid`), außer `--ctid` gesetzt |
 | Template | `debian-12-standard` (neuestes auf Storage `local`) |
@@ -49,22 +49,28 @@ Das Skript (`set -euo pipefail`, idempotent):
 2. erstellt den LXC `worklenz` (`onboot: 1`, unprivilegiert, `nesting=1,keyctl=1`),
 3. installiert im Container Docker + Compose-Plugin, klont Upstream nach `/opt/worklenz`,
    legt `.env` mit zufälligen Secrets (`openssl rand -hex 32`) und URLs auf die
-   aktuelle Container-IP an, schreibt die systemd-Unit, `systemctl enable --now worklenz`,
-4. verifiziert `systemctl is-active worklenz` + HTTP auf `127.0.0.1:80` und
-   `127.0.0.1:5000` und gibt die finalen URLs + Container-IP aus.
+   aktuelle Container-IP an, erzeugt bei Bedarf ein self-signed SSL-Zertifikat
+   (`nginx/ssl/`, wie Upstream-`manage.sh`), schreibt die systemd-Unit,
+   `systemctl enable --now worklenz`,
+4. verifiziert `systemctl is-active worklenz` + HTTP auf `127.0.0.1:80/health`,
+   `127.0.0.1:5000` und `127.0.0.1:3000/public/health` und gibt die finalen
+   URLs + Container-IP aus. (`:80/` leitet per Upstream-Config auf HTTPS um —
+   darum prüft der Installer bewusst `/health`, das ohne Redirect 200 liefert.)
 
 Erwartete Schlussausgabe (Beispiel):
 
 ```text
 [OK]    Service läuft (systemctl is-active worklenz = active).
-[OK]    Nginx antwortet (HTTP 200 auf localhost:80).
+[OK]    Nginx antwortet (HTTP 200 auf localhost:80/health).
 [OK]    Frontend antwortet (HTTP 200 auf localhost:5000).
+[OK]    Backend antwortet (HTTP 200 auf localhost:3000/public/health).
 
 ════════════════ INSTALLATION ERFOLGREICH ════════════════
   App          : Worklenz – All-in-one Projektmanagement
   Container    : CT 100 (Hostname: worklenz, onboot=1)
   Ressourcen   : 2 vCPU / 4096 MB RAM / 20 GB Disk
-  Web-UI       : http://192.168.1.100:80
+  Web-UI       : https://192.168.1.100 (self-signed – Warnung bestätigen)
+  Health       : http://192.168.1.100:80/health
   Frontend     : http://192.168.1.100:5000
   API          : http://192.168.1.100:3000
   Portal       : http://192.168.1.100:5174
@@ -74,7 +80,7 @@ Erwartete Schlussausgabe (Beispiel):
   Stack        : cd /opt/worklenz && docker compose ps / docker compose logs -f (im Container)
   Update       : Skript erneut laufen lassen (idempotent, zieht neueste Images + restart)
   Deinstall    : pct stop 100 && pct destroy 100
-  Reboot-Test  : pct reboot 100 && sleep 90 && curl -fs http://192.168.1.100:80 >/dev/null && curl -fs http://192.168.1.100:5000 >/dev/null
+  Reboot-Test  : pct reboot 100 && sleep 90 && curl -fs http://192.168.1.100:80/health >/dev/null && curl -fs http://192.168.1.100:5000 >/dev/null
   Log          : /tmp/worklenz-install-2026-....log
 ══════════════════════════════════════════════════════════
 ```
@@ -87,8 +93,11 @@ pct reboot $CT
 sleep 90   # Erster Start nach Reboot: Docker + 7 Dienste + DB-Init brauchen ~60–90 s
 pct exec $CT -- systemctl is-active worklenz   # muss: active
 pct exec $CT -- docker ps --format '{{.Names}} {{.Status}}'
-curl -fs http://$(pct exec $CT -- ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1):80 >/dev/null && echo NGINX-OK
+curl -fs http://$(pct exec $CT -- ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1):80/health >/dev/null && echo NGINX-OK
 curl -fs http://$(pct exec $CT -- ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1):5000 >/dev/null && echo FRONTEND-OK
+curl -fs http://$(pct exec $CT -- ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1):3000/public/health >/dev/null && echo BACKEND-OK
+# Hinweis: https://<LXC-IP> braucht curl -k (self-signed):
+curl -kfs https://$(pct exec $CT -- ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1) >/dev/null && echo WEBUI-OK
 pct config $CT | grep -i onboot              # muss: onboot: 1
 ```
 
@@ -106,8 +115,9 @@ Manuell im Container:
 pct enter 100
 cd /opt/worklenz && docker compose pull && docker compose up -d
 systemctl restart worklenz && systemctl status worklenz --no-pager --full
-curl -fs http://127.0.0.1:80 >/dev/null && echo NGINX-OK
+curl -fs http://127.0.0.1:80/health >/dev/null && echo NGINX-OK
 curl -fs http://127.0.0.1:5000 >/dev/null && echo FRONTEND-OK
+curl -fs http://127.0.0.1:3000/public/health >/dev/null && echo BACKEND-OK
 ```
 
 ## 4. Deinstallation
@@ -165,7 +175,13 @@ damit der Einzeiler ohne weitere Dateien auskommt. Der Compose-Stack aus Upstrea
   er erkennt die neue IP und schreibt `DOMAIN`/`VITE_API_URL`/`FRONTEND_URL`/
   `S3_PUBLIC_URL` in `/opt/worklenz/.env` neu (Secrets bleiben). Für stabile URLs
   DHCP-Reservierung oder statische IP einrichten.
-- **Kein TLS im Erstinstall:** `ENABLE_SSL=false`; HTTPS-Port 443 ist im Compose
-  vorgesehen, Zertifikate optional später via Upstream-`manage.sh ssl`.
+- **Kein TLS im Erstinstall:** Der Installer erzeugt ein self-signed Zertifikat
+  (`nginx/ssl/`, wie Upstream-`manage.sh`) — im Browser die Warnung bestätigen.
+  Echtes TLS optional später via Upstream-`manage.sh ssl` (Let's Encrypt).
+- **Backend-Worker-Fehler (`import_jobs`/`task_export_jobs does not exist)?**
+  Das ist Upstream-Rauschen aus dem laufenden 3.2.0-Backend gegen das
+  Main-Branch-Basis-Schema — tritt mit Upstreams eigenem `quick-setup.sh`
+  identisch auf, betrifft nur Hintergrund-Worker-Ticks, nicht die Web-UI.
+  Kein Installer-Fehler; ggf. Upstream-Issue prüfen.
 - Erster Start zieht ~3–4 GB Images + DB-Init — Web UI kann 2–5 Minuten brauchen
   (beide Ports werden bis zu 240 s gepollt).
