@@ -642,7 +642,23 @@ else
   SIGNUP_CODE="\$(curl -s -o "\$SIGNUP_OUT" -w "%{http_code}" --max-time 30 -H "Content-Type: application/json" -d "\$SIGNUP_JSON" "http://127.0.0.1:\$BACKEND_PORT/secure/signup" 2>/dev/null || true)"
   [[ -z "\$SIGNUP_CODE" ]] && SIGNUP_CODE="000"
   echo "[LXC] Signup-Antwort (HTTP \$SIGNUP_CODE): \$(head -c 500 "\$SIGNUP_OUT" 2>/dev/null | tr '\n' ' ' || true)"
+  SIGNUP_OK=0
   if grep -q '"done":true' "\$SIGNUP_OUT" 2>/dev/null || { [[ "\$SIGNUP_CODE" == "302" ]] && grep -qi 'secure/verify' "\$SIGNUP_OUT" 2>/dev/null; }; then
+    # Harte Verifikation (Login-Gates aus passport-local-login.js belegt):
+    # User-Zeile + aktives Team-Mitglied + Bcrypt-Vergleich mit Backend-Modul.
+    # Erst wenn alles stimmt, gelten die Credentials als druckfaehig.
+    if DBROW="\$(docker compose exec -T db psql -U "\$DBU" -d "\$DBN" -tAc "SELECT u.id FROM users u JOIN team_members tm ON tm.user_id=u.id WHERE LOWER(u.email)=LOWER('\$ADMIN_EMAIL') AND u.is_deleted IS FALSE AND tm.active IS TRUE LIMIT 1" 2>/dev/null | tr -d '[:space:]' || true)"; [[ -n "\$DBROW" ]]; then
+      DBHASH="\$(docker compose exec -T db psql -U "\$DBU" -d "\$DBN" -tAc "SELECT password FROM users WHERE LOWER(email)=LOWER('\$ADMIN_EMAIL') LIMIT 1" 2>/dev/null | tr -d '[:space:]' || true)"
+      if [[ -n "\$DBHASH" ]] && docker compose exec -T backend node -e "process.exit(require('bcrypt').compareSync(process.argv[1],process.argv[2])?0:1)" "\$ADMIN_PW" "\$DBHASH" 2>/dev/null; then
+        SIGNUP_OK=1
+      else
+        echo "[LXC][WARN] Admin-Zeile existiert, aber Passwort-Hash stimmt nicht mit dem Install-Passwort ueberein."
+      fi
+    else
+      echo "[LXC][WARN] Keine aktive Admin-Mitgliedschaft in der DB trotz Signup-Antwort – Details: docker compose logs backend."
+    fi
+  fi
+  if [[ "\$SIGNUP_OK" == "1" ]]; then
     printf '%s\n' "\$ADMIN_EMAIL" > /opt/worklenz/.admin-created
     chmod 600 /opt/worklenz/.admin-created
     { printf '%s\n' "\$ADMIN_EMAIL"; printf '%s\n' "\$ADMIN_PW"; } > /tmp/worklenz-admin-creds
@@ -653,6 +669,10 @@ else
     chmod 600 /opt/worklenz/.admin-created
     echo "[LXC][WARN] Admin-Mail existiert bereits – kein neuer Account (Passwort aus Erstlauf verwenden)."
   else
+    CHECK_OUT="\$(mktemp)"
+    curl -s --max-time 20 -H "Content-Type: application/json" -d "\$SIGNUP_JSON" "http://127.0.0.1:\$BACKEND_PORT/secure/signup/check" -o "\$CHECK_OUT" 2>/dev/null || true
+    echo "[LXC] Signup-Check-Antwort: \$(head -c 300 "\$CHECK_OUT" 2>/dev/null | tr '\n' ' ' || true)"
+    rm -f "\$CHECK_OUT"
     echo "[LXC][WARN] Erst-Admin konnte nicht angelegt werden – manuell im Browser registrieren (Name mind. 4 Zeichen, Passwort mind. 8 Zeichen mit Gross-/Kleinbuchstabe, Ziffer + Sonderzeichen @\\$!%*?&#)."
   fi
   rm -f "\$SIGNUP_OUT"
