@@ -623,7 +623,7 @@ else
   SIGNUP_CODE="\$(curl -s -o "\$SIGNUP_OUT" -w "%{http_code}" --max-time 30 -H "Content-Type: application/json" -d "\$SIGNUP_JSON" "http://127.0.0.1:\$BACKEND_PORT/secure/signup" 2>/dev/null || true)"
   [[ -z "\$SIGNUP_CODE" ]] && SIGNUP_CODE="000"
   echo "[LXC] Signup-Antwort (HTTP \$SIGNUP_CODE): \$(head -c 500 "\$SIGNUP_OUT" 2>/dev/null | tr '\n' ' ' || true)"
-  if grep -q '"done":true' "\$SIGNUP_OUT" 2>/dev/null; then
+  if grep -q '"done":true' "\$SIGNUP_OUT" 2>/dev/null || { [[ "\$SIGNUP_CODE" == "302" ]] && grep -qi 'secure/verify' "\$SIGNUP_OUT" 2>/dev/null; }; then
     printf '%s\n' "\$ADMIN_EMAIL" > /opt/worklenz/.admin-created
     chmod 600 /opt/worklenz/.admin-created
     { printf '%s\n' "\$ADMIN_EMAIL"; printf '%s\n' "\$ADMIN_PW"; } > /tmp/worklenz-admin-creds
@@ -634,7 +634,7 @@ else
     chmod 600 /opt/worklenz/.admin-created
     echo "[LXC][WARN] Admin-Mail existiert bereits – kein neuer Account (Passwort aus Erstlauf verwenden)."
   else
-    echo "[LXC][WARN] Erst-Admin konnte nicht angelegt werden – manuell im Browser registrieren (Name mind. 4 Zeichen, Passwort mind. 8 Zeichen mit Gross-/Kleinbuchstabe, Ziffer + Sonderzeichen @\$!%*?&#)."
+    echo "[LXC][WARN] Erst-Admin konnte nicht angelegt werden – manuell im Browser registrieren (Name mind. 4 Zeichen, Passwort mind. 8 Zeichen mit Gross-/Kleinbuchstabe, Ziffer + Sonderzeichen @\\$!%*?&#)."
   fi
   rm -f "\$SIGNUP_OUT"
   unset ADMIN_PW
