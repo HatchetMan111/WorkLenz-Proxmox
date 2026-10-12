@@ -514,11 +514,13 @@ set_url() {
   fi
 }
 set_url DOMAIN "\$LXC_IP"
-set_url VITE_API_URL "http://\$LXC_IP"
-set_url VITE_SOCKET_URL "ws://\$LXC_IP"
-set_url FRONTEND_URL "http://\$LXC_IP"
-set_url SERVER_CORS "*"
-set_url SOCKET_IO_CORS "http://\$LXC_IP"
+# Upstream-Konvention (manage.sh auto_configure_env): alles https/wss auf die
+# Domain/IP – sonst Mixed-Content-Block (https-Seite ruft http-API) + :80-Redirect.
+set_url VITE_API_URL "https://\$LXC_IP"
+set_url VITE_SOCKET_URL "wss://\$LXC_IP"
+set_url FRONTEND_URL "https://\$LXC_IP"
+set_url SERVER_CORS "https://\$LXC_IP"
+set_url SOCKET_IO_CORS "https://\$LXC_IP"
 set_url S3_PUBLIC_URL "http://\$LXC_IP:${S3_PORT}/worklenz-bucket"
 set_url WORKLENZ_DEPLOYMENT_MODE "self_hosted"
 set_url DEPLOYMENT_MODE "express"
@@ -560,7 +562,9 @@ else
   systemctl start worklenz
 fi
 sleep 10
-docker compose up -d
+# --force-recreate: .env-Aenderungen (URLs/Secrets) erreichen die Container nur
+# bei Neuerstellung (Entrypoint laeuft erneut: env-config.sh, DB-Env). Volumes bleiben.
+docker compose up -d --force-recreate
 sleep 5
 
 wait_for_http() {
@@ -605,27 +609,18 @@ if ! wait_for_http "Backend (/public/health)" "http://127.0.0.1:\$BACKEND_PORT/p
 fi
 
 # --- Erst-Admin anlegen (idempotent, ueber die app-eigene Signup-API) ---
-# Nutzt POST /api/auth/signup mit CSRF-Flow wie das Frontend (api-client.ts):
-# GET /csrf-token -> POST mit X-CSRF-Token + Session-Cookie. Dadurch stimmen
+# 3.2.0-Route (im Image verifiziert: app.use("/secure", authRouter)):
+# POST /secure/signup mit {"name","email","password"} – steht in 3.2.0 auf der
+# CSRF-Ausnahmeliste (authPaths), daher kein Token/Flow noetig. Dadurch stimmen
 # Validierung, Hash und Org-Anlage garantiert (kein SQL-Hack ins DB-Schema).
 rm -f /tmp/worklenz-admin-creds
 if [[ -f /opt/worklenz/.admin-created ]]; then
   echo "[LXC] Erst-Admin bereits angelegt (\$(cat /opt/worklenz/.admin-created 2>/dev/null || echo unbekannt)) – wird nicht erneut erstellt."
 else
   ADMIN_PW="\$(printf '%s' "\$ADMIN_PASSWORD_B64" | base64 -d)"
-  # Kein sed-Maskieren noetig: Host validiert, dass keine JSON/Heredoc-
-  # Sonderzeichen (", \, $, Backtick) in den Werten stecken.
   SIGNUP_JSON="{\"name\":\"\$ADMIN_NAME\",\"email\":\"\$ADMIN_EMAIL\",\"password\":\"\$ADMIN_PW\"}"
-  JAR="\$(mktemp)"
-  CSRF="\$(curl -fsS -c "\$JAR" -b "\$JAR" --max-time 15 "http://127.0.0.1:\$BACKEND_PORT/csrf-token" 2>/dev/null | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || true)"
-  if [[ -z "\$CSRF" ]]; then echo "[LXC][WARN] Kein CSRF-Token erhalten – Admin-Anlage wird trotzdem versucht (ohne Header)."; fi
   SIGNUP_OUT="\$(mktemp)"
-  if [[ -n "\$CSRF" ]]; then
-    SIGNUP_CODE="\$(curl -s -o "\$SIGNUP_OUT" -w "%{http_code}" --max-time 30 -b "\$JAR" -c "\$JAR" -H "Content-Type: application/json" -H "X-CSRF-Token: \$CSRF" -d "\$SIGNUP_JSON" "http://127.0.0.1:\$BACKEND_PORT/api/auth/signup" 2>/dev/null || true)"
-  else
-    SIGNUP_CODE="\$(curl -s -o "\$SIGNUP_OUT" -w "%{http_code}" --max-time 30 -b "\$JAR" -c "\$JAR" -H "Content-Type: application/json" -d "\$SIGNUP_JSON" "http://127.0.0.1:\$BACKEND_PORT/api/auth/signup" 2>/dev/null || true)"
-  fi
-  rm -f "\$JAR"
+  SIGNUP_CODE="\$(curl -s -o "\$SIGNUP_OUT" -w "%{http_code}" --max-time 30 -H "Content-Type: application/json" -d "\$SIGNUP_JSON" "http://127.0.0.1:\$BACKEND_PORT/secure/signup" 2>/dev/null || true)"
   [[ -z "\$SIGNUP_CODE" ]] && SIGNUP_CODE="000"
   echo "[LXC] Signup-Antwort (HTTP \$SIGNUP_CODE): \$(head -c 500 "\$SIGNUP_OUT" 2>/dev/null | tr '\n' ' ' || true)"
   if grep -q '"done":true' "\$SIGNUP_OUT" 2>/dev/null; then
@@ -639,7 +634,7 @@ else
     chmod 600 /opt/worklenz/.admin-created
     echo "[LXC][WARN] Admin-Mail existiert bereits – kein neuer Account (Passwort aus Erstlauf verwenden)."
   else
-    echo "[LXC][WARN] Erst-Admin konnte nicht angelegt werden – manuell im Browser registrieren (Name mind. 4 Zeichen, Passwort mind. 8 Zeichen mit Gross-/Kleinbuchstabe, Ziffer + Sonderzeichen @$!%*?&#)."
+    echo "[LXC][WARN] Erst-Admin konnte nicht angelegt werden – manuell im Browser registrieren (Name mind. 4 Zeichen, Passwort mind. 8 Zeichen mit Gross-/Kleinbuchstabe, Ziffer + Sonderzeichen @\$!%*?&#)."
   fi
   rm -f "\$SIGNUP_OUT"
   unset ADMIN_PW
