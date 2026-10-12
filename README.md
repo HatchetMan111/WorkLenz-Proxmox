@@ -201,10 +201,12 @@ Schluss-Box (danach steht er zusätzlich im Install-Log — sicher verwahren):
   anmelden, danach unter Profil **Passwort ändern**.
 - Eigene Werte (idempotent, Re-Run legt nichts doppelt an):
   ```bash
-  bash worklenz.sh --ctid 100 --admin-email ich@domain.tld --admin-name "Mein Name"
+  bash worklenz.sh --ctid 100 --admin-email ich@domain.tld --admin-name "Mein Name" --admin-team "Mein Team"
   bash worklenz.sh --ctid 100 --admin-email ich@domain.tld --admin-password 'Starkes-Passwort!9A'
-  # als ENV: ADMIN_EMAIL=.. ADMIN_PASSWORD=.. ADMIN_NAME=.. bash worklenz.sh --ctid 100
+  # als ENV: ADMIN_EMAIL=.. ADMIN_PASSWORD=.. ADMIN_NAME=.. ADMIN_TEAM=.. bash worklenz.sh --ctid 100
   ```
+  `team_name` ist Pflichtfeld der 3.2.0-Signup-API (ohne schlägt sie mit
+  „Team name is required" fehl — genau das ist bei Box-losen Läufen passiert).
   Passwort-Policy (Upstream, sonst schlägt die Anlage fehl): mind. 8 Zeichen,
   Klein- + Großbuchstabe + Ziffer + Sonderzeichen aus `@$!%*?&#`; Name mind.
   4 Zeichen. Das generierte Default-Passwort erfüllt das immer.

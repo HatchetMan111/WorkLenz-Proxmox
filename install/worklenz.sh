@@ -46,8 +46,10 @@ UNPRIVILEGED="1"
 FEATURES="nesting=1,keyctl=1"                # nesting/keyctl = Docker im LXC nötig
 
 # Erst-Admin (wird per App-Signup-API angelegt + in Schluss-Box gedruckt)
+# team_name ist Pflichtfeld der Signup-API (3.2.0-Code, sonst "Team name is required").
 DEFAULT_ADMIN_EMAIL="admin@worklenz.local"
 DEFAULT_ADMIN_NAME="Worklenz Admin"
+DEFAULT_ADMIN_TEAM="Worklenz"
 
 # Umgebungs-Overrides erlauben: CT_ID=101 CORES=4 RAM=8192 DISK=20 ./worklenz.sh
 CT_ID_ARG="${CT_ID:-${CTID:-}}"
@@ -57,6 +59,7 @@ DISK_ARG="${DISK:-$DEFAULT_DISK}"
 ADMIN_EMAIL_ARG="${ADMIN_EMAIL:-}"
 ADMIN_PASSWORD_ARG="${ADMIN_PASSWORD:-}"
 ADMIN_NAME_ARG="${ADMIN_NAME:-}"
+ADMIN_TEAM_ARG="${ADMIN_TEAM:-}"
 
 DEBUG="${DEBUG:-0}"
 LOG_FILE="/tmp/${APP}-install-$(date +%F-%H%M%S).log"
@@ -106,6 +109,7 @@ Optionen:
   --admin-email MAIL   Erst-Admin-Mail (Default: admin@worklenz.local)
   --admin-password PW  Erst-Admin-Passwort (Default: zufällig generiert, Policy-konform)
   --admin-name NAME    Erst-Admin-Name (Default: Worklenz Admin)
+  --admin-team TEAM    Erst-Admin-Team (Default: Worklenz, Pflichtfeld der Signup-API)
   --debug, -x          set -x + maximale Fehlermeldungskette
   --help, -h           diese Hilfe
 
@@ -181,6 +185,7 @@ SSH_KEY=""
 ADMIN_EMAIL="$ADMIN_EMAIL_ARG"
 ADMIN_PASSWORD="$ADMIN_PASSWORD_ARG"
 ADMIN_NAME="$ADMIN_NAME_ARG"
+ADMIN_TEAM="$ADMIN_TEAM_ARG"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -197,6 +202,7 @@ while [[ $# -gt 0 ]]; do
     --admin-email)     ADMIN_EMAIL="${2:?--admin-email braucht einen Wert}"; shift 2 ;;
     --admin-password)  ADMIN_PASSWORD="${2:?--admin-password braucht einen Wert}"; shift 2 ;;
     --admin-name)      ADMIN_NAME="${2:?--admin-name braucht einen Wert}"; shift 2 ;;
+    --admin-team)      ADMIN_TEAM="${2:?--admin-team braucht einen Wert}"; shift 2 ;;
     --debug|-x)        DEBUG="1"; set -x; shift ;;
     --help|-h)         usage; exit 0 ;;
     *) msg_error "Unbekannte Option: $1"; usage; exit 1 ;;
@@ -371,6 +377,7 @@ UNIT_EOF
 # Klein-/Großbuchstabe, Ziffer, Sonderzeichen – vgl. SignupPage-Regeln)
 if [[ -z "$ADMIN_EMAIL" ]]; then ADMIN_EMAIL="$DEFAULT_ADMIN_EMAIL"; fi
 if [[ -z "$ADMIN_NAME" ]]; then ADMIN_NAME="$DEFAULT_ADMIN_NAME"; fi
+if [[ -z "$ADMIN_TEAM" ]]; then ADMIN_TEAM="$DEFAULT_ADMIN_TEAM"; fi
 if [[ -z "$ADMIN_PASSWORD" ]]; then
   ADMIN_PASSWORD="Apw-$(openssl rand -hex 10)!9"
 fi
@@ -379,7 +386,7 @@ ADMIN_PASSWORD_B64="$(printf '%s' "$ADMIN_PASSWORD" | base64 -w0)"
 # Zeichen, die Heredoc-Expansion ("$", Backtick) oder JSON (" , \) brechen,
 # werden abgelehnt (Allowlist-Pruefung, kein Backslash-Literal noetig).
 # Generiertes Default-Passwort enthaelt nur Allowlist-Zeichen.
-for _av in "$ADMIN_EMAIL" "$ADMIN_NAME" "$ADMIN_PASSWORD"; do
+for _av in "$ADMIN_EMAIL" "$ADMIN_NAME" "$ADMIN_TEAM" "$ADMIN_PASSWORD"; do
   _kept="$(printf '%s' "$_av" | tr -cd 'A-Za-z0-9@._+! #%*=?^{|}~,:;()/=-')"
   if [[ "$_kept" != "$_av" ]]; then
     msg_error "Admin-Wert mit unzulässigen Zeichen: '${_av:0:30}...' – erlaubt: Buchstaben/Ziffern/Leerzeichen plus @._+! #%*=?^~,:;()/=- (kein \" \\ \$ Backtick [ ] & ' \` + = |)."
@@ -401,6 +408,7 @@ UPSTREAM_REPO="${UPSTREAM_REPO}"
 ADMIN_EMAIL="${ADMIN_EMAIL}"
 ADMIN_PASSWORD_B64="${ADMIN_PASSWORD_B64}"
 ADMIN_NAME="${ADMIN_NAME}"
+ADMIN_TEAM="${ADMIN_TEAM}"
 
 echo "[LXC] apt update + Basis-Pakete ..."
 export DEBIAN_FRONTEND=noninteractive
@@ -610,15 +618,26 @@ fi
 
 # --- Erst-Admin anlegen (idempotent, ueber die app-eigene Signup-API) ---
 # 3.2.0-Route (im Image verifiziert: app.use("/secure", authRouter)):
-# POST /secure/signup mit {"name","email","password"} – steht in 3.2.0 auf der
-# CSRF-Ausnahmeliste (authPaths), daher kein Token/Flow noetig. Dadurch stimmen
-# Validierung, Hash und Org-Anlage garantiert (kein SQL-Hack ins DB-Schema).
+# POST /secure/signup mit {"name","email","password","team_name"} – team_name ist
+# Pflichtfeld ("Team name is required"), Route steht auf der CSRF-Ausnahmeliste,
+# daher kein Token/Flow noetig. Dadurch stimmen Validierung, Hash und Org-Anlage
+# garantiert (kein SQL-Hack ins DB-Schema).
 rm -f /tmp/worklenz-admin-creds
 if [[ -f /opt/worklenz/.admin-created ]]; then
   echo "[LXC] Erst-Admin bereits angelegt (\$(cat /opt/worklenz/.admin-created 2>/dev/null || echo unbekannt)) – wird nicht erneut erstellt."
 else
+  # Vorab-Pruefung in der DB (Tabellen/Spalten aus Login-Strategie belegt):
+  # Existiert die Mail schon (z. B. manuell angelegt), wird NICHTS ueberschrieben
+  # und kein falsches Passwort gedruckt.
+  DBU="\$(grep -E '^DB_USER=' /opt/worklenz/.env | head -n1 | cut -d= -f2)"; DBU="\${DBU:-postgres}"
+  DBN="\$(grep -E '^DB_NAME=' /opt/worklenz/.env | head -n1 | cut -d= -f2)"; DBN="\${DBN:-worklenz_db}"
+  if docker compose exec -T db psql -U "\$DBU" -d "\$DBN" -tAc "SELECT 1 FROM users WHERE LOWER(email)=LOWER('\$ADMIN_EMAIL') LIMIT 1" 2>/dev/null | grep -q 1; then
+    printf '%s\n' "\$ADMIN_EMAIL" > /opt/worklenz/.admin-created
+    chmod 600 /opt/worklenz/.admin-created
+    echo "[LXC][WARN] Admin-Mail \$ADMIN_EMAIL existiert bereits in der DB – kein neuer Account (mit dem urspruenglichen Passwort anmelden)."
+  else
   ADMIN_PW="\$(printf '%s' "\$ADMIN_PASSWORD_B64" | base64 -d)"
-  SIGNUP_JSON="{\"name\":\"\$ADMIN_NAME\",\"email\":\"\$ADMIN_EMAIL\",\"password\":\"\$ADMIN_PW\"}"
+  SIGNUP_JSON="{\"name\":\"\$ADMIN_NAME\",\"email\":\"\$ADMIN_EMAIL\",\"password\":\"\$ADMIN_PW\",\"team_name\":\"\$ADMIN_TEAM\"}"
   SIGNUP_OUT="\$(mktemp)"
   SIGNUP_CODE="\$(curl -s -o "\$SIGNUP_OUT" -w "%{http_code}" --max-time 30 -H "Content-Type: application/json" -d "\$SIGNUP_JSON" "http://127.0.0.1:\$BACKEND_PORT/secure/signup" 2>/dev/null || true)"
   [[ -z "\$SIGNUP_CODE" ]] && SIGNUP_CODE="000"
@@ -638,6 +657,7 @@ else
   fi
   rm -f "\$SIGNUP_OUT"
   unset ADMIN_PW
+  fi
 fi
 echo "[LXC] Service aktiv: \$(systemctl is-active worklenz)"
 echo "[LXC] Container: \$(docker ps --format '{{.Names}} {{.Status}}' | tr '\\n' '; ')"
